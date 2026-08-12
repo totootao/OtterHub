@@ -1,7 +1,7 @@
 // https://developers.cloudflare.com/workers/wrangler/configuration/
 {
-	"name": "otterhub",
-	"compatibility_date": "2026-01-01",
+	"name": "otterhubi",
+	"compatibility_date": "2026-08-12",
 	"assets": {
 		// The path to the directory containing the `index.html` file to be served at `/`
 		"directory": "./frontend/out"
