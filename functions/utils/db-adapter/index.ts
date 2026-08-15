@@ -7,14 +7,23 @@ import { CF } from "types";
 // 存储适配器接口定义
 export interface DBAdapter {
   // 上传单个完整文件；waitUntil 可选，传入后 AI 分析将在后台异步执行
-  uploadFile(file: File | Blob | Uint8Array, metadata: FileMetadata, waitUntil?: (p: Promise<any>) => void): Promise<{ key: string }>;
-  uploadStream(stream: ReadableStream, metadata: FileMetadata, waitUntil?: (p: Promise<any>) => void, mimeType?: string): Promise<{ key: string }>;
+  uploadFile(
+    file: File | Blob | Uint8Array,
+    metadata: FileMetadata,
+    waitUntil?: (p: Promise<any>) => void
+  ): Promise<{ key: string }>;
+  uploadStream(
+    stream: ReadableStream,
+    metadata: FileMetadata,
+    waitUntil?: (p: Promise<any>) => void,
+    mimeType?: string
+  ): Promise<{ key: string }>;
   // 上传分片文件
   uploadChunk(
     key: string,
     chunkIndex: number,
     chunkFile: File | Blob,
-    waitUntil?: (promise: Promise<any>) => void,
+    waitUntil?: (promise: Promise<any>) => void
   ): Promise<{ chunkIndex: number }>;
 
   // 获取文件，永远返回Response
@@ -45,15 +54,21 @@ export enum DBAdapterType {
 // 存储适配器工厂类
 export class DBAdapterFactory {
   private static adapterInstances: Map<string, DBAdapter> = new Map();
-
   static getAdapter(env: any, adapterType?: string): DBAdapter {
     const type =
       adapterType || (isDev(env) ? DBAdapterType.R2 : DBAdapterType.TG);
 
+    // 缓存 key 附加 KV 后端标识：适配器实例会持有 env 引用，
+    // 远程 KV（自托管）与 Cloudflare KV 的 oh_file_url 实例不同，必须分开缓存，
+    // 否则首次构造后跨请求复用旧 env，导致远程 KV 切换失效
+    // （用实例标记属性判断，避免 esbuild 压缩类名导致 constructor.name 失效）
+    const kvKind = env?.[CF.KV_NAME]?.__isRemoteKV ? "remote" : "cf";
+    const cacheKey = `${type}:${kvKind}`;
+
     // 检查缓存中是否已有实例
-    if (this.adapterInstances.has(type)) {
-      // console.log(`DBAdapter hit: ${type}`);
-      return this.adapterInstances.get(type)!;
+    if (this.adapterInstances.has(cacheKey)) {
+      // console.log(`DBAdapter hit: ${cacheKey}`);
+      return this.adapterInstances.get(cacheKey)!;
     }
 
     // 创建新实例
@@ -68,7 +83,7 @@ export class DBAdapterFactory {
       default:
         throw new Error(`Unsupported storage adapter type: ${type}`);
     }
-    this.adapterInstances.set(type, adapter);
+    this.adapterInstances.set(cacheKey, adapter);
 
     return adapter;
   }

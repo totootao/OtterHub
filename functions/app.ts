@@ -12,12 +12,24 @@ import { telegramWebhookRoutes } from "./routes/telegram/webhook";
 import { webdavRoutes } from "./routes/webdav";
 import { Hono } from "hono";
 import type { Env } from "./types/hono";
+import { resolveRemoteKV } from "./utils/remote-kv";
 
 export const app = new Hono<{
   Bindings: Env;
 }>().basePath("");
 
 // Global Middleware
+
+// 远程 KV 注入：配置 KV_ENDPOINT + KV_AUTH_TOKEN 后，将 oh_file_url 整体替换为自托管 KV，
+// 绕过 Cloudflare KV 每日写入配额限制（必须在所有路由之前执行）
+app.use("*", async (c, next) => {
+  const remote = resolveRemoteKV(c.env);
+  if (remote) {
+    (c.env as any).oh_file_url = remote;
+  }
+  await next();
+});
+
 app.use("*", corsMiddleware);
 
 // Routes

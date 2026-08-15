@@ -32,6 +32,11 @@ export type Env = {
   TG_BOT_TOKEN?: string;
   TG_WEBHOOK_SECRET?: string;
 
+  /** 自托管远程 KV（可选）：配置后元数据存储整体切换到自建服务，绕过 Cloudflare KV 写配额限制 */
+  KV_ENDPOINT?: string;
+  KV_AUTH_TOKEN?: string;
+  KV_BASE_PATH?: string;
+
   /** Workers AI binding，可选；不配置时 AI 富化功能自动跳过 */
   AI?: WorkersAI;
 };
