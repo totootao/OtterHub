@@ -71,6 +71,7 @@ OtterHub 是一个 **为个人使用场景定制** 的私人云盘方案：
 - **基础管理功能**：批量下载 / 删除，搜索 / 收藏 / 排序 / 标签
 - **Telegram 频道上传**：频道 / 群内发送 ≤20MB 文件后自动注册到 OtterHub，并可回复直链
 - **AI 图片分析**：网页端上传图片后可自动生成简要描述，便于图片检索（需配置 Workers AI binding，可在设置页关闭）
+- **WebDAV 协议支持**：`/dav` 端点可挂载到 Windows 网络驱动器、macOS Finder、RaiDrive、Cyberduck、rclone 等客户端，像本地磁盘一样管理网盘文件
 
 ---
 
@@ -193,6 +194,58 @@ curl "https://api.telegram.org/bot<YOUR_BOT_TOKEN>/getWebhookInfo"
 ### 5. 重新部署
 
 回到部署页面重试部署，让环境变量和 KV 绑定生效。
+
+---
+
+## 📁 WebDAV 使用指南
+
+OtterHub 内置标准 WebDAV 服务端（等级 1/2），部署后即可将网盘挂载为本地磁盘。
+
+### 连接信息
+
+| 项目     | 值                                 |
+| -------- | ---------------------------------- |
+| 服务地址 | `https://<你的域名>/dav/`          |
+| 用户名   | 任意（如 `admin`）                 |
+| 密码     | 登录密码 `PASSWORD` 或 `API_TOKEN` |
+
+### 客户端配置示例
+
+**Windows（映射网络驱动器）**：此电脑 → 映射网络驱动器 → 文件夹填 `https://<域名>/dav/` → 输入密码勾选"使用其他凭据"。
+
+**macOS Finder**：前往 → 连接服务器（⌘K）→ 输入 `https://<域名>/dav/` → 选择"注册用户"输入密码。
+
+**rclone**：
+
+```bash
+rclone config
+# 类型选 webdav，url = https://<域名>/dav
+# vendor = other，user = admin，pass = 登录密码
+rclone ls remote:img          # 列出图片
+rclone copy ./movie.mp4 remote:video/
+```
+
+**RaiDrive / Cyberduck / Mountain Duck**：协议选 WebDAV(HTTPS)，地址填域名，路径 `/dav`，密码同上。
+
+### 目录结构与操作
+
+- 虚拟目录按文件类型划分：`/img`、`/video`、`/audio`、`/doc`
+- 支持的操作：
+  - 浏览：`PROPFIND`（Depth 0/1）
+  - 上传：`PUT`（≤20MB 直传，>20MB 自动分片，单文件上限 1GB）
+  - 下载：`GET` / `HEAD`（支持 HTTP Range 断点续传，与网页端缓存互通）
+  - 重命名 / 移动：`MOVE`（同目录为重命名；跨目录移动仅重命名，文件仍归属原类型目录，但可通过新路径访问）
+  - 复制：`COPY`（读取源文件后重新写入，大于 20MB 自动分片）
+  - 删除：`DELETE`（移入回收站，可在网页端恢复，30 天后自动清除）
+  - 锁：`LOCK` / `UNLOCK`（兼容性假锁，保证 Windows 客户端可写入）
+  - 属性：`PROPPATCH`（接受请求但属性不持久化）
+
+### 注意事项
+
+- **无法创建文件夹**：目录是按文件类型虚拟生成的（`MKCOL` 返回 405），与网页端的类型分栏保持一致
+- **权限**：WebDAV 拥有与登录密码同等的全部权限（包括删除私有文件），请妥善保管密码；建议客户端走 HTTPS
+- **覆盖上传**：同名文件再次 PUT 会把旧文件移入回收站后写入新文件
+- **兼容性**：已通过 43 项 E2E 测试（认证 / PROPFIND / PUT / GET / Range / 21MB 分片 / MOVE / COPY / 中文文件名 / LOCK 等），见 `test/webdav.js`
 
 ---
 

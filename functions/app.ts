@@ -9,6 +9,7 @@ import { trashRoutes } from "./routes/trash";
 import { proxyRoutes } from "./routes/proxy";
 import { shareRoutes } from "./routes/share";
 import { telegramWebhookRoutes } from "./routes/telegram/webhook";
+import { webdavRoutes } from "./routes/webdav";
 import { Hono } from "hono";
 import type { Env } from "./types/hono";
 
@@ -31,6 +32,7 @@ app.route("/trash", trashRoutes);
 app.route("/proxy", proxyRoutes);
 app.route("/share", shareRoutes);
 app.route("/telegram", telegramWebhookRoutes);
+app.route("/dav", webdavRoutes);
 
 // Export AppType for RPC
 export type AppType = typeof app;
