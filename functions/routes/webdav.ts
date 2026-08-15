@@ -37,7 +37,7 @@ const DAV_CLASS = "1, 2";
 const DAV_ALLOW =
   "OPTIONS, GET, HEAD, PUT, DELETE, PROPFIND, PROPPATCH, MKCOL, MOVE, COPY, LOCK, UNLOCK";
 
-const TYPE_DIRS = [
+export const TYPE_DIRS = [
   { dir: "img", type: FileType.Image },
   { dir: "video", type: FileType.Video },
   { dir: "audio", type: FileType.Audio },
@@ -209,7 +209,7 @@ function parseDavTarget(target: string): DavPath | null {
 // ==========================================
 
 /** 分片是否已上传完整（未完成的上传不在 WebDAV 中可见） */
-function isCompleteFile(md: FileMetadata | null | undefined): boolean {
+export function isCompleteFile(md: FileMetadata | null | undefined): boolean {
   if (!md) return false;
   if (md.chunkInfo) {
     return (md.chunkInfo.uploadedIndices?.length ?? 0) >= md.chunkInfo.total;
@@ -223,12 +223,15 @@ function isCompleteFile(md: FileMetadata | null | undefined): boolean {
 // 文件的 metadata.fileName 同样存相对路径（如 "photos/2024/a.jpg"），
 // 目录列表 = 目录标记 ∪ 文件路径前缀推导出的隐式子目录。
 
-function dirMarkerKey(type: FileType, dirPath: string): string {
+export function dirMarkerKey(type: FileType, dirPath: string): string {
   return `${type}:dir:${dirPath}`;
 }
 
 /** 类型下全部条目（文件 + 目录标记），自动翻页 */
-async function listAllOfType(kv: any, type: FileType): Promise<FileItem[]> {
+export async function listAllOfType(
+  kv: any,
+  type: FileType
+): Promise<FileItem[]> {
   const out: FileItem[] = [];
   let cursor: string | undefined;
   let guard = 0;
@@ -243,12 +246,12 @@ async function listAllOfType(kv: any, type: FileType): Promise<FileItem[]> {
   return out;
 }
 
-type DirEntry =
+export type DirEntry =
   | { kind: "file"; item: FileItem }
   | { kind: "dir"; name: string; uploadedAt: number };
 
 /** 列出某目录下的直接子项（文件 + 子目录），dirPath 为 "" 表示类型根 */
-async function listDirEntries(
+export async function listDirEntries(
   kv: any,
   type: FileType,
   dirPath: string
@@ -303,7 +306,7 @@ async function listDirEntries(
 }
 
 /** 目录是否存在：显式标记存在（fileName 与路径一致），或该前缀下有任意条目（隐式目录） */
-async function dirExists(
+export async function dirExists(
   kv: any,
   type: FileType,
   dirPath: string
@@ -364,7 +367,7 @@ async function findFileInType(
 /** 按文件名在指定类型内查找文件（不做跨类型兜底：
  *  跨类型 MOVE/COPY 已是真实复制，文件在目标类型真实存在，
  *  全局兜底会让其他目录路径错误命中同名文件，破坏目录隔离语义） */
-async function findFileByName(
+export async function findFileByName(
   kv: any,
   fileName: string,
   preferredType?: FileType
@@ -497,7 +500,7 @@ class ChunkReader {
 // 上传辅助
 // ==========================================
 
-function buildMetadata(
+export function buildMetadata(
   fileName: string,
   fileSize: number,
   totalChunks?: number
@@ -514,7 +517,7 @@ function buildMetadata(
 }
 
 /** 初始化分片上传记录（与 /upload/chunk/init 逻辑一致） */
-async function initChunkedKey(
+export async function initChunkedKey(
   kv: any,
   type: FileType,
   fileName: string,
@@ -538,7 +541,7 @@ interface PutResult {
 }
 
 /** 小文件直接上传 */
-async function putSmall(
+export async function putSmall(
   c: Context<{ Bindings: Env }>,
   fileName: string,
   mime: string,
