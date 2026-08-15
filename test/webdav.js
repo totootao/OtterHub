@@ -175,6 +175,41 @@ describe("WebDAV", function () {
       assert.equal(await get.text(), newBody.toString());
     });
 
+    it("should PUT an empty file (0 bytes) and GET empty content back", async function () {
+      const put = await authed("/doc/empty-marker.txt", {
+        method: "PUT",
+        headers: { "Content-Type": "text/plain" },
+        body: new Uint8Array(0),
+      });
+      assert.equal(put.status, 201);
+
+      const head = await authed("/doc/empty-marker.txt", { method: "HEAD" });
+      assert.equal(head.status, 200);
+
+      const get = await authed("/doc/empty-marker.txt");
+      assert.equal(get.status, 200);
+      // undici 会剥离空 body 响应的 Content-Length 头，故以 body 长度为准
+      assert.equal((await get.arrayBuffer()).byteLength, 0);
+      const cl = get.headers.get("content-length");
+      assert.ok(cl === "0" || cl === null, `content-length=${cl}`);
+
+      // PROPFIND 列表中大小为 0
+      const pf = await authed("/doc/", {
+        method: "PROPFIND",
+        headers: { Depth: "1" },
+        body: PROPFIND_BODY,
+      });
+      const xml = await pf.text();
+      assert.ok(xml.includes("empty-marker.txt"), "empty file in listing");
+      assert.ok(
+        xml.includes("<D:getcontentlength>0</D:getcontentlength>"),
+        "empty file size 0 in listing"
+      );
+
+      const del = await authed("/doc/empty-marker.txt", { method: "DELETE" });
+      assert.equal(del.status, 204);
+    });
+
     it("should support HEAD with metadata headers", async function () {
       const res = await authed(`/doc/${SMALL_NAME}`, { method: "HEAD" });
       assert.equal(res.status, 200);
@@ -362,8 +397,8 @@ describe("WebDAV", function () {
       assert.equal(res.status, 412);
     });
 
-    it("should allow cross-directory MOVE with fallback resolution", async function () {
-      // 移动到 /dav/img/ 目录：仅重命名，文件仍归属 doc 类型，但可通过目标路径访问
+    it("should allow cross-directory MOVE (real copy to target collection)", async function () {
+      // 移动到 /dav/img/：真实复制到 img 类型 + 删除 doc 原件，目标列表可见
       const res = await authed(`/doc/${copied}`, {
         method: "MOVE",
         headers: {
@@ -399,7 +434,7 @@ describe("WebDAV", function () {
 
   // ---------- 其他方法 ----------
   describe("MKCOL / PROPPATCH / LOCK / UNLOCK", function () {
-    it("should reject MKCOL with 405 (virtual collections only)", async function () {
+    it("should reject MKCOL at root level with 405 (virtual collections only)", async function () {
       const res = await authed("/newfolder/", { method: "MKCOL" });
       assert.equal(res.status, 405);
     });
@@ -482,6 +517,431 @@ describe("WebDAV", function () {
       assert.ok((res.headers.get("content-type") || "").includes("text/html"));
       const html = await res.text();
       assert.ok(html.includes("OtterHub WebDAV"));
+    });
+  });
+
+  // ---------- 嵌套目录（MKCOL / 目录 PROPFIND / 目录 MOVE / 目录 DELETE） ----------
+  describe("Nested directories (alist mount scenarios)", function () {
+    const DIR = "projects";
+    const SUB = "projects/2024";
+    const DEEP = "projects/2024/q1";
+
+    before(async function () {
+      // 清理历史残留
+      await authed(`/doc/${DIR}/`, { method: "DELETE" }).catch(() => {});
+    });
+
+    after(async function () {
+      // 递归清理本组创建的资源
+      for (const p of [
+        `/doc/${DIR}/`,
+        `/doc/renamed/`,
+        `/doc/auto/`,
+        `/img/${DIR}/`,
+        `/doc/目录测试/`,
+        `/doc/moved-into-sub.txt`,
+        `/doc/renamed.txt`,
+      ]) {
+        // 先删目录内文件（无递归删除 API，用已知文件名）
+        await authed(p, { method: "DELETE" }).catch(() => {});
+      }
+      for (const f of [
+        `/doc/${DIR}/readme.txt`,
+        `/doc/${SUB}/plan.txt`,
+        `/doc/${DEEP}/deep.bin`,
+        `/doc/renamed/readme.txt`,
+        `/doc/renamed/2024/plan.txt`,
+        `/doc/auto/inner/file.txt`,
+        `/img/${DIR}/readme.txt`,
+        `/doc/目录测试/文件.txt`,
+      ]) {
+        await authed(f, { method: "DELETE" }).catch(() => {});
+      }
+      for (const d of [
+        `/doc/${DEEP}/`,
+        `/doc/${SUB}/`,
+        `/doc/${DIR}/`,
+        `/doc/renamed/2024/`,
+        `/doc/renamed/`,
+        `/doc/auto/inner/`,
+        `/doc/auto/`,
+        `/img/${DIR}/`,
+        `/doc/目录测试/`,
+      ]) {
+        await authed(d, { method: "DELETE" }).catch(() => {});
+      }
+    });
+
+    // ---- MKCOL ----
+    it("should MKCOL create a subdirectory (201)", async function () {
+      const res = await authed(`/doc/${DIR}/`, { method: "MKCOL" });
+      assert.equal(res.status, 201);
+    });
+
+    it("should MKCOL nested subdirectory under existing parent (201)", async function () {
+      const res = await authed(`/doc/${SUB}/`, { method: "MKCOL" });
+      assert.equal(res.status, 201);
+    });
+
+    it("should reject MKCOL on existing directory (405)", async function () {
+      const res = await authed(`/doc/${DIR}/`, { method: "MKCOL" });
+      assert.equal(res.status, 405);
+    });
+
+    it("should reject MKCOL when parent missing (409)", async function () {
+      const res = await authed("/doc/ghost/deep/", { method: "MKCOL" });
+      assert.equal(res.status, 409);
+    });
+
+    it("should reject MKCOL with request body (415)", async function () {
+      const res = await authed("/doc/bodydir/", {
+        method: "MKCOL",
+        body: "<mkcol/>",
+      });
+      assert.equal(res.status, 415);
+    });
+
+    it("should reject MKCOL with path traversal (405)", async function () {
+      const res = await authed("/doc/..%2Fevil/", { method: "MKCOL" });
+      assert.equal(res.status, 405);
+    });
+
+    // ---- 空目录 PROPFIND ----
+    it("should PROPFIND empty directory (207, self only)", async function () {
+      const res = await authed(`/doc/${DIR}/`, {
+        method: "PROPFIND",
+        headers: { Depth: "1" },
+        body: PROPFIND_BODY,
+      });
+      assert.equal(res.status, 207);
+      const xml = await res.text();
+      assert.ok(xml.includes(`<D:href>/dav/doc/${DIR}/</D:href>`));
+      assert.ok(xml.includes("<D:collection/>"));
+    });
+
+    it("should PROPFIND directory without trailing slash (207)", async function () {
+      const res = await authed(`/doc/${DIR}`, {
+        method: "PROPFIND",
+        headers: { Depth: "0" },
+        body: PROPFIND_BODY,
+      });
+      assert.equal(res.status, 207);
+      const xml = await res.text();
+      assert.ok(xml.includes(`<D:href>/dav/doc/${DIR}/</D:href>`));
+    });
+
+    it("should PROPFIND return 404 for missing directory", async function () {
+      const res = await authed("/doc/no-such-dir/", {
+        method: "PROPFIND",
+        headers: { Depth: "1" },
+        body: PROPFIND_BODY,
+      });
+      assert.equal(res.status, 404);
+    });
+
+    // ---- 嵌套上传/下载 ----
+    it("should PUT file into subdirectory (201) and GET it back", async function () {
+      const body = "nested readme content";
+      const put = await authed(`/doc/${DIR}/readme.txt`, {
+        method: "PUT",
+        body,
+      });
+      assert.equal(put.status, 201);
+
+      const get = await authed(`/doc/${DIR}/readme.txt`);
+      assert.equal(get.status, 200);
+      assert.equal(await get.text(), body);
+    });
+
+    it("should PUT file into deep nested directory (auto-created)", async function () {
+      const put = await authed(`/doc/${DEEP}/deep.bin`, {
+        method: "PUT",
+        body: Buffer.from([1, 2, 3, 4, 5]),
+      });
+      assert.equal(put.status, 201);
+    });
+
+    it("should PUT create implicit directories (no MKCOL needed)", async function () {
+      const put = await authed("/doc/auto/inner/file.txt", {
+        method: "PUT",
+        body: "implicit dir",
+      });
+      assert.equal(put.status, 201);
+
+      const list = await authed("/doc/auto/", {
+        method: "PROPFIND",
+        headers: { Depth: "1" },
+        body: PROPFIND_BODY,
+      });
+      const xml = await list.text();
+      assert.ok(
+        xml.includes("<D:href>/dav/doc/auto/inner/</D:href>"),
+        "implicit subdir visible"
+      );
+    });
+
+    // ---- 目录列举 ----
+    it("should list subdirectory with nested dirs and files (depth 1)", async function () {
+      const res = await authed(`/doc/${DIR}/`, {
+        method: "PROPFIND",
+        headers: { Depth: "1" },
+        body: PROPFIND_BODY,
+      });
+      assert.equal(res.status, 207);
+      const xml = await res.text();
+      assert.ok(xml.includes(`<D:href>/dav/doc/${DIR}/readme.txt</D:href>`));
+      assert.ok(xml.includes(`<D:href>/dav/doc/${SUB}/</D:href>`));
+      assert.ok(
+        !xml.includes(`<D:href>/dav/doc/${DEEP}/</D:href>`),
+        "grandchild dir not at this level"
+      );
+    });
+
+    it("should show subdirectory in parent collection listing", async function () {
+      const res = await authed("/doc/", {
+        method: "PROPFIND",
+        headers: { Depth: "1" },
+        body: PROPFIND_BODY,
+      });
+      const xml = await res.text();
+      assert.ok(xml.includes(`<D:href>/dav/doc/${DIR}/</D:href>`));
+    });
+
+    it("should HEAD file in nested path with correct size", async function () {
+      const res = await authed(`/doc/${DIR}/readme.txt`, { method: "HEAD" });
+      assert.equal(res.status, 200);
+      assert.equal(res.headers.get("content-length"), "21"); // "nested readme content"
+    });
+
+    it("should GET directory HTML index for subdirectory", async function () {
+      const res = await authed(`/doc/${DIR}/`);
+      assert.equal(res.status, 200);
+      const html = await res.text();
+      assert.ok(html.includes("readme.txt"));
+      assert.ok(html.includes("2024/"));
+    });
+
+    // ---- 目录内文件 MOVE ----
+    it("should MOVE file into subdirectory", async function () {
+      const put = await authed("/doc/plain-file.txt", {
+        method: "PUT",
+        body: "to be moved into subdir",
+      });
+      assert.equal(put.status, 201);
+
+      const mv = await authed("/doc/plain-file.txt", {
+        method: "MOVE",
+        headers: { Destination: `/dav/doc/${SUB}/plan.txt`, Overwrite: "F" },
+      });
+      assert.equal(mv.status, 201);
+
+      const viaNew = await authed(`/doc/${SUB}/plan.txt`);
+      assert.equal(viaNew.status, 200);
+      assert.equal(await viaNew.text(), "to be moved into subdir");
+
+      const viaOld = await authed("/doc/plain-file.txt");
+      assert.equal(viaOld.status, 404);
+    });
+
+    // ---- 目录 MOVE ----
+    it("should MOVE (rename) directory within same collection", async function () {
+      const res = await authed(`/doc/${DIR}/`, {
+        method: "MOVE",
+        headers: { Destination: `/dav/doc/renamed/`, Overwrite: "F" },
+      });
+      assert.equal(res.status, 201);
+
+      // 目录内容经新路径可达
+      const readme = await authed("/doc/renamed/readme.txt");
+      assert.equal(readme.status, 200);
+
+      const deep = await authed(`/doc/renamed/2024/q1/deep.bin`);
+      assert.equal(deep.status, 200);
+
+      // 旧路径不可达
+      const oldList = await authed(`/doc/${DIR}/`, {
+        method: "PROPFIND",
+        headers: { Depth: "0" },
+        body: PROPFIND_BODY,
+      });
+      assert.equal(oldList.status, 404);
+
+      // 新目录可列出子目录
+      const list = await authed("/doc/renamed/", {
+        method: "PROPFIND",
+        headers: { Depth: "1" },
+        body: PROPFIND_BODY,
+      });
+      const xml = await list.text();
+      assert.ok(xml.includes("<D:href>/dav/doc/renamed/2024/</D:href>"));
+    });
+
+    it("should MOVE directory without trailing slash (client variant)", async function () {
+      // 改回原名（无尾斜杠形式）
+      const res = await authed(`/doc/renamed`, {
+        method: "MOVE",
+        headers: { Destination: `/dav/doc/${DIR}`, Overwrite: "F" },
+      });
+      assert.equal(res.status, 201);
+      const readme = await authed(`/doc/${DIR}/readme.txt`);
+      assert.equal(readme.status, 200);
+    });
+
+    it("should reject directory MOVE onto existing destination (412)", async function () {
+      const mk = await authed("/doc/occupied/", { method: "MKCOL" });
+      assert.equal(mk.status, 201);
+      const res = await authed(`/doc/${DIR}/`, {
+        method: "MOVE",
+        headers: { Destination: "/dav/doc/occupied/", Overwrite: "F" },
+      });
+      assert.equal(res.status, 412);
+      await authed("/doc/occupied/", { method: "DELETE" });
+    });
+
+    it("should reject directory MOVE into itself (409)", async function () {
+      const res = await authed(`/doc/${DIR}/`, {
+        method: "MOVE",
+        headers: { Destination: `/dav/doc/${DIR}/2024/inside/` },
+      });
+      assert.equal(res.status, 409);
+    });
+
+    // ---- 跨类型目录 MOVE ----
+    it("should MOVE directory across collections (doc → img)", async function () {
+      const res = await authed(`/doc/${DIR}/`, {
+        method: "MOVE",
+        headers: { Destination: `/dav/img/${DIR}/`, Overwrite: "F" },
+      });
+      assert.equal(res.status, 201);
+
+      // 新路径可访问
+      const readme = await authed(`/img/${DIR}/readme.txt`);
+      assert.equal(readme.status, 200);
+      assert.equal(await readme.text(), "nested readme content");
+
+      // 目标目录列表可见（跨类型移动是真实复制）
+      const list = await authed(`/img/${DIR}/`, {
+        method: "PROPFIND",
+        headers: { Depth: "1" },
+        body: PROPFIND_BODY,
+      });
+      const xml = await list.text();
+      assert.ok(xml.includes(`<D:href>/dav/img/${DIR}/readme.txt</D:href>`));
+
+      // 旧路径失效
+      const old = await authed(`/doc/${DIR}/readme.txt`);
+      assert.equal(old.status, 404);
+
+      // 移回 doc 以便后续清理
+      const back = await authed(`/img/${DIR}/`, {
+        method: "MOVE",
+        headers: { Destination: `/dav/doc/${DIR}/`, Overwrite: "F" },
+      });
+      assert.equal(back.status, 201);
+    });
+
+    // ---- 目录 COPY ----
+    it("should reject COPY on directory (400, client must recurse)", async function () {
+      const res = await authed(`/doc/${DIR}/`, {
+        method: "COPY",
+        headers: { Destination: "/dav/doc/copydir/" },
+      });
+      assert.equal(res.status, 400);
+    });
+
+    // ---- 目录 DELETE ----
+    it("should reject DELETE on non-empty directory (409)", async function () {
+      const res = await authed(`/doc/${DIR}/`, { method: "DELETE" });
+      assert.equal(res.status, 409);
+    });
+
+    it("should DELETE empty deep directory (204) then PROPFIND 404", async function () {
+      // 标准 MKCOL 需逐级创建
+      assert.equal(
+        (await authed("/doc/empty-dir/", { method: "MKCOL" })).status,
+        201
+      );
+      assert.equal(
+        (await authed("/doc/empty-dir/l1/", { method: "MKCOL" })).status,
+        201
+      );
+      const mk = await authed("/doc/empty-dir/l1/l2/", { method: "MKCOL" });
+      assert.equal(mk.status, 201);
+      // 删最深的空目录
+      const del = await authed("/doc/empty-dir/l1/l2/", { method: "DELETE" });
+      assert.equal(del.status, 204);
+      const pf = await authed("/doc/empty-dir/l1/l2/", {
+        method: "PROPFIND",
+        headers: { Depth: "0" },
+        body: PROPFIND_BODY,
+      });
+      assert.equal(pf.status, 404);
+      // 清理剩余空目录
+      await authed("/doc/empty-dir/l1/", { method: "DELETE" });
+      await authed("/doc/empty-dir/", { method: "DELETE" });
+    });
+
+    // ---- 中文目录名 ----
+    it("should support unicode directory names end-to-end", async function () {
+      const dir = encodeURIComponent("目录测试");
+      const file = encodeURIComponent("文件.txt");
+      const mk = await authed(`/doc/${dir}/`, { method: "MKCOL" });
+      assert.equal(mk.status, 201);
+
+      const put = await authed(`/doc/${dir}/${file}`, {
+        method: "PUT",
+        body: "中文目录内容",
+      });
+      assert.equal(put.status, 201);
+
+      const list = await authed(`/doc/${dir}/`, {
+        method: "PROPFIND",
+        headers: { Depth: "1" },
+        body: PROPFIND_BODY,
+      });
+      const xml = await list.text();
+      assert.ok(xml.includes(`<D:href>/dav/doc/${dir}/${file}</D:href>`));
+
+      const get = await authed(`/doc/${dir}/${file}`);
+      assert.equal(await get.text(), "中文目录内容");
+    });
+
+    // ---- 清理：删除本组全部内容 ----
+    it("cleanup: delete all nested test resources", async function () {
+      // 先删文件，再删目录（空目录语义）
+      const files = [
+        `/doc/${DIR}/readme.txt`,
+        `/doc/${SUB}/plan.txt`,
+        `/doc/${DEEP}/deep.bin`,
+        "/doc/auto/inner/file.txt",
+        `/doc/目录测试/文件.txt`,
+      ];
+      for (const f of files) {
+        const del = await authed(f, { method: "DELETE" });
+        assert.equal(del.status, 204, `delete ${f}`);
+      }
+      const dirs = [
+        `/doc/${DEEP}/`,
+        `/doc/${SUB}/`,
+        `/doc/${DIR}/`,
+        "/doc/auto/inner/",
+        "/doc/auto/",
+        "/doc/目录测试/",
+      ];
+      for (const d of dirs) {
+        const del = await authed(d, { method: "DELETE" });
+        // 显式目录标记 → 204；隐式目录（无标记）在文件删除后自动消失 → 404
+        assert.ok(
+          [204, 404].includes(del.status),
+          `delete ${d}: ${del.status}`
+        );
+      }
+      const pf = await authed(`/doc/${DIR}/`, {
+        method: "PROPFIND",
+        headers: { Depth: "0" },
+        body: PROPFIND_BODY,
+      });
+      assert.equal(pf.status, 404);
     });
   });
 });

@@ -2,7 +2,12 @@ import { BaseAdapter } from "./base-adapter";
 import { getTextFromCache, putTextToCache } from "@utils/cache";
 import { failResponse } from "@utils/response";
 import { encodeContentDisposition } from "../common";
-import { buildKeyId, getFileIdFromKey, getContentTypeByExt } from "../file";
+import {
+  buildKeyId,
+  getFileIdFromKey,
+  getContentTypeByExt,
+  getFileTypeByMimeOrExt,
+} from "../file";
 
 import {
   FileMetadata,
@@ -82,6 +87,38 @@ export class TGAdapter extends BaseAdapter {
     }
 
     const { fileName } = metadata;
+
+    // 空文件：Telegram 拒绝 0 字节上传（"file must be non-empty"），
+    // 改传 1 字节占位并在 metadata 打标，get() 时短路返回空内容
+    const isEmpty = metadata.fileSize === 0;
+    if (isEmpty) {
+      const ext = fileName.split(".").pop()?.toLowerCase() || "";
+      const mime = getContentTypeByExt(ext);
+      // 类型按扩展名推导，与常规路径一致，保证文件出现在对应类型目录列表中
+      const fileType = getFileTypeByMimeOrExt(mime, ext);
+      const placeholder = new File([new Uint8Array([0x20])], fileName, {
+        type: mime,
+      });
+      const formData = new FormData();
+      formData.append("chat_id", this.env.TG_CHAT_ID);
+      formData.append("document", placeholder);
+      const result = await this.sendToTelegram(formData, "sendDocument");
+      if (!result.success) {
+        throw new Error(result.message);
+      }
+      const tgFileId = getTgFileId(result.data);
+      if (!tgFileId) {
+        throw new Error("Failed to extract Telegram file_id for empty file");
+      }
+      const key = buildKeyId(fileType, tgFileId, ext);
+      metadata.emptyFile = true;
+      metadata.fileSize = 0; // 逻辑大小保持 0（TG 返回的实际 1 字节不覆盖）
+      const kv = this.env[this.kvName];
+      if (kv) {
+        await kv.put(key, "", { metadata });
+      }
+      return { key };
+    }
 
     // 如果不是 File 实例，将其转换为 File
     let finalFile: File;
@@ -294,6 +331,25 @@ export class TGAdapter extends BaseAdapter {
 
     if (!metadata) {
       return failResponse(`Metadata not found for key: ${key}`, 404);
+    }
+
+    // 空文件短路：物理存储是 1 字节占位，直接返回空内容（不回源 TG）
+    if (metadata.emptyFile) {
+      const ext = key.substring(key.lastIndexOf(".") + 1);
+      const headers = new Headers();
+      headers.set("Content-Type", getContentTypeByExt(ext));
+      headers.set(
+        "Content-Disposition",
+        encodeContentDisposition(metadata.fileName)
+      );
+      headers.set("Accept-Ranges", "bytes");
+      const range = req?.headers.get("Range");
+      if (range) {
+        // 0 字节文件无法满足任何 bytes 区间
+        headers.set("Content-Range", "bytes */0");
+        return new Response(null, { status: 416, headers });
+      }
+      return new Response(null, { status: 200, headers });
     }
 
     // 检查是否为分片合并文件（依据 metadata.chunkInfo）

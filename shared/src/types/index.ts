@@ -48,6 +48,8 @@ export type FileMetadata = {
   chunkInfo?: ChunkInfo; // 分片信息（大文件分片上传时使用）
   thumbUrl?: string; // 缩略图URL
   desc?: string; // 图片简短描述（上传后 AI 自动分析填充）
+  isDir?: boolean; // WebDAV 目录标记（MKCOL 创建的虚拟目录，fileName 存相对路径）
+  emptyFile?: boolean; // 空文件标记（TG 不接受 0 字节，物理存储为 1 字节占位，读取时返回空内容）
 };
 
 export enum FileTag {
@@ -191,6 +193,7 @@ export interface ShareMetaResponse {
 
 export const MAX_FILENAME_LENGTH = 128; // 最大文件名长度（包括扩展名）
 export const MAX_DESC_LENGTH = 300; // 最大描述长度
+export const MAX_PATH_LENGTH = 512; // WebDAV 嵌套路径最大总长度（相对类型目录，含斜杠）
 
 export const MAX_CHUNK_SIZE = 20 * 1024 * 1024; // 20MB, TG BOT API 可供下载的最大文件大小为20MB
 

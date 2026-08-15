@@ -185,7 +185,12 @@ def chunk_upload(file_type, file_name, stream, total_size, on_progress=None):
                 )
 
             ok = False
-            for attempt in range(3):
+            last_err = ""
+            # 503/502 通常是 Worker 1102 资源耗尽：隔离实例堆内垃圾触发大 GC 计入 CPU。
+            # 实例池恢复需 2~5 分钟，退避序列累计约 7 分钟确保跨过恢复周期；
+            # 分片上传服务端幂等（重复分片自动跳过），长退避重发安全。
+            backoffs = [15, 30, 60, 120, 180]
+            for attempt in range(len(backoffs) + 1):
                 try:
                     files = {"chunkFile": (file_name, buf)}
                     resp = SESSION.post(
@@ -198,11 +203,19 @@ def chunk_upload(file_type, file_name, stream, total_size, on_progress=None):
                     if resp.status_code == 200:
                         ok = True
                         break
-                except requests.RequestException:
-                    pass
-                time.sleep(2 * (attempt + 1))
+                    last_err = f"HTTP {resp.status_code} {resp.text[:200]}"
+                    if resp.status_code in (502, 503, 504) and attempt < len(backoffs):
+                        wait = backoffs[attempt]
+                        print(f"[gateway] chunk {index}: {last_err[:80]}... "
+                              f"等 {wait}s 后重试 ({attempt + 1}/{len(backoffs)})", file=sys.stderr, flush=True)
+                        time.sleep(wait)
+                        continue
+                except requests.RequestException as e:
+                    last_err = str(e)
+                if attempt < len(backoffs):
+                    time.sleep(backoffs[attempt])
             if not ok:
-                raise RuntimeError(f"chunk {index} upload failed: HTTP {resp.status_code} {resp.text[:200]}")
+                raise RuntimeError(f"chunk {index} upload failed: {last_err[:300]}")
 
             received += want
             index += 1
