@@ -1,7 +1,8 @@
 "use client";
 
-import { Search, X, Settings2 } from "lucide-react";
+import { Search, X, Settings2, FolderTree } from "lucide-react";
 import { useFileQueryStore } from "@/stores/file";
+import { useFileUIStore } from "@/stores/file";
 import { useIsMobile } from "@/hooks/use-mobile";
 import { Button } from "./ui/button";
 import { FileTypeDropdown } from "./FileTypeDropdown";
@@ -10,6 +11,8 @@ import { ImageLoadModeToggle } from "./ImageLoadModeToggle";
 import { SafeModeToggle } from "./SafeModeToggle";
 import { ThemeToggle } from "./ThemeToggle";
 import { Input } from "./ui/input";
+import { cn } from "@/lib/utils";
+import { ViewMode } from "@/lib/types";
 import {
   Sheet,
   SheetTrigger,
@@ -30,6 +33,15 @@ export function Header() {
   const { searchQuery, setSearchQuery } = useFileQueryStore();
   const isMobile = useIsMobile();
 
+  const viewMode = useFileUIStore((s) => s.viewMode);
+  const setViewMode = useFileUIStore((s) => s.setViewMode);
+  const lastNonFolderViewMode = useFileUIStore((s) => s.lastNonFolderViewMode);
+  const isFolderView = viewMode === ViewMode.Folder;
+
+  /** 点击左上角 Logo：文件夹浏览 ↔ 最近一次平铺视图 */
+  const toggleFolderView = () =>
+    setViewMode(isFolderView ? lastNonFolderViewMode : ViewMode.Folder);
+
   // 移动端头部导航栏
   if (isMobile) {
     return (
@@ -37,9 +49,22 @@ export function Header() {
         <div className="flex h-16 items-center px-4">
           <div className="flex w-full items-center justify-between animate-in fade-in duration-300">
             <div className="flex items-center gap-2.5">
-              <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-linear-to-br from-primary to-accent text-xl shadow-lg shadow-primary/20">
+              <button
+                type="button"
+                onClick={toggleFolderView}
+                title={isFolderView ? "返回平铺视图" : "切换文件夹浏览模式"}
+                className="relative flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-linear-to-br from-primary to-accent text-xl shadow-lg shadow-primary/20 transition-transform active:scale-95"
+              >
                 🦦
-              </div>
+                <span
+                  className={cn(
+                    "pointer-events-none absolute -bottom-1 -right-1 flex h-4 w-4 items-center justify-center rounded-full bg-primary text-primary-foreground shadow-md transition-all",
+                    isFolderView ? "scale-100 opacity-100" : "scale-0 opacity-0"
+                  )}
+                >
+                  <FolderTree className="h-2.5 w-2.5" />
+                </span>
+              </button>
               <span className="text-lg font-bold tracking-tight text-foreground">
                 {APP_NAME}
               </span>
@@ -126,24 +151,44 @@ export function Header() {
   return (
     <header className="sticky top-0 z-40 w-full border-b border-glass-border bg-glass-bg/70 backdrop-blur-xl">
       <div className="flex h-20 items-center justify-between px-6 md:px-8">
-        {/* Left: Logo */}
-        <div
+        {/* Left: Logo（点击切换文件夹浏览模式） */}
+        <button
+          type="button"
+          onClick={toggleFolderView}
+          title={isFolderView ? "返回平铺视图" : "切换文件夹浏览模式"}
           className="flex items-center gap-4 group cursor-pointer shrink-0"
-          title="返回顶部"
-          onClick={() => window.scrollTo({ top: 0, behavior: "smooth" })}
         >
-          <div className="flex h-11 w-11 items-center justify-center rounded-2xl bg-linear-to-br from-primary to-accent text-2xl shadow-xl shadow-primary/20 transition-transform group-hover:scale-110">
+          <div
+            className={cn(
+              "relative flex h-11 w-11 items-center justify-center rounded-2xl bg-linear-to-br from-primary to-accent text-2xl shadow-xl shadow-primary/20 transition-transform group-hover:scale-110 group-active:scale-95",
+              isFolderView &&
+                "ring-2 ring-primary/60 ring-offset-2 ring-offset-transparent"
+            )}
+          >
             🦦
+            <span
+              className={cn(
+                "pointer-events-none absolute -bottom-1.5 -right-1.5 flex h-5 w-5 items-center justify-center rounded-full bg-primary text-primary-foreground shadow-md transition-all",
+                isFolderView ? "scale-100 opacity-100" : "scale-0 opacity-0"
+              )}
+            >
+              <FolderTree className="h-3 w-3" />
+            </span>
           </div>
-          <div className="hidden lg:block">
+          <div className="hidden lg:block text-left">
             <h1 className="text-xl font-black tracking-tighter text-foreground leading-none">
               {APP_NAME}
             </h1>
-            <p className="text-[10px] font-bold uppercase tracking-[0.2em] text-primary/60 mt-1">
-              {APP_CATEGORY}
+            <p
+              className={cn(
+                "text-[10px] font-bold uppercase tracking-[0.2em] mt-1 transition-colors",
+                isFolderView ? "text-primary" : "text-primary/60"
+              )}
+            >
+              {isFolderView ? "文件夹浏览" : APP_CATEGORY}
             </p>
           </div>
-        </div>
+        </button>
 
         {/* Center: Tabs */}
         <div className="flex-1 flex justify-center px-4">

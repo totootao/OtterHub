@@ -8,6 +8,8 @@ import { useMemo } from "react";
 
 interface FileUIState {
   viewMode: ViewMode;
+  /** 文件夹模式之外最近一次视图（头部 Logo 切回时恢复） */
+  lastNonFolderViewMode: ViewMode;
   itemsPerPage: number;
   currentPage: number;
   sortType: SortType;
@@ -40,6 +42,7 @@ export const useFileUIStore = create<FileUIState>()(
   persist(
     (set, _get) => ({
       viewMode: ViewMode.Grid,
+      lastNonFolderViewMode: ViewMode.Grid,
       itemsPerPage: 20,
       currentPage: 0,
       sortType: SortType.UploadedAt,
@@ -57,7 +60,13 @@ export const useFileUIStore = create<FileUIState>()(
       forceLoadFiles: [],
 
       setViewMode: (mode) => {
-        set({ viewMode: mode, currentPage: 0 }); // 切换视图模式时重置页码
+        // 切换视图模式时重置页码；同步记录文件夹模式外的最近视图
+        set((state) => ({
+          viewMode: mode,
+          currentPage: 0,
+          lastNonFolderViewMode:
+            mode !== ViewMode.Folder ? mode : state.lastNonFolderViewMode,
+        }));
       },
 
       setItemsPerPage: (count) => {
@@ -153,6 +162,12 @@ export const useFileUIStore = create<FileUIState>()(
         sortOrder: state.sortOrder,
         fabPosition: state.fabPosition,
       }),
+      // lastNonFolderViewMode 不持久化：恢复时若 viewMode 非文件夹模式则同步之
+      onRehydrateStorage: () => (state) => {
+        if (state && state.viewMode !== ViewMode.Folder) {
+          useFileUIStore.setState({ lastNonFolderViewMode: state.viewMode });
+        }
+      },
     }
   )
 );
