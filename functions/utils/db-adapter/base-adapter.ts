@@ -82,7 +82,7 @@ export abstract class BaseAdapter implements DBAdapter {
     parentKey: string,
     chunkIndex: number,
     fileName?: string
-  ): Promise<string | { chunkId: string; thumbUrl?: string }>;
+  ): Promise<string | { chunkId: string; thumbUrl?: string; slot?: number }>;
 
   /**
    * 子类可选实现的方法：生成分片 ID
@@ -147,11 +147,13 @@ export abstract class BaseAdapter implements DBAdapter {
 
     let chunkId: string;
     let thumbUrl: string | undefined;
+    let chunkSlot: number | undefined;
     if (typeof result === "string") {
       chunkId = result;
     } else {
       chunkId = result.chunkId;
       thumbUrl = result.thumbUrl;
+      chunkSlot = result.slot;
     }
 
     console.log(`[uploadChunk] Uploaded chunk ${chunkIndex}: ${chunkId}`);
@@ -162,7 +164,8 @@ export abstract class BaseAdapter implements DBAdapter {
       chunkIndex,
       chunkId,
       chunkFile.size,
-      thumbUrl
+      thumbUrl,
+      chunkSlot
     );
 
     return { chunkIndex };
@@ -218,7 +221,8 @@ export abstract class BaseAdapter implements DBAdapter {
     chunkIndex: number,
     chunkId: string,
     chunkSize: number,
-    thumbUrl?: string
+    thumbUrl?: string,
+    chunkSlot?: number
   ): Promise<void> {
     const kv = this.env[this.kvName];
     const maxRetries = 3;
@@ -259,6 +263,7 @@ export abstract class BaseAdapter implements DBAdapter {
           idx: chunkIndex,
           file_id: chunkId,
           size: chunkSize,
+          slot: chunkSlot, // TG 多 Bot 池槽位（file_id 与 bot 绑定，下载须用对应 bot）
         });
 
         // 如果有缩略图且元数据中没有，则更新

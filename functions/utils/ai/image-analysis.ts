@@ -1,5 +1,6 @@
 import { FileMetadata, MAX_DESC_LENGTH } from "@shared/types";
 import { buildTgFileUrl, getTgFilePath } from "@utils/db-adapter/tg-tools";
+import { getTgSlot } from "@utils/tg-pool";
 
 type WorkersAI = {
   run(model: string, inputs: Record<string, unknown>): Promise<unknown>;
@@ -9,19 +10,28 @@ type AIEnv = {
   AI?: WorkersAI;
   TG_BOT_TOKEN?: string;
   TG_CHAT_ID?: string;
+  TG_BOT_POOLS?: string;
 };
 
 type KVWithMetadata = {
   put(key: string, value: unknown, opts?: unknown): Promise<void>;
-  getWithMetadata<T = unknown>(key: string): Promise<{ value: unknown; metadata: T | null }>;
+  getWithMetadata<T = unknown>(
+    key: string
+  ): Promise<{ value: unknown; metadata: T | null }>;
 };
 
 type AIImageSource = {
   previewFileId?: string | null;
   tgFileId?: string | null; // 用于兜底的原图 ID
+  tgSlot?: number; // TG 多 Bot 池槽位（file_id 与 bot 绑定）
 };
 
-const SUPPORTED_IMAGE_PREFIXES = ["image/jpeg", "image/png", "image/webp", "image/gif"];
+const SUPPORTED_IMAGE_PREFIXES = [
+  "image/jpeg",
+  "image/png",
+  "image/webp",
+  "image/gif",
+];
 const AI_INPUT_MAX_BYTES = 2 * 1024 * 1024; // 仅用于内存文件的兜底限制
 
 export const AI_MODEL = "@cf/llava-hf/llava-1.5-7b-hf";
@@ -31,9 +41,13 @@ export const AI_OUTPUT_PROMPT =
   "Return precise, comma-separated image tags. " +
   "Priority: subject > action > style > scene. " +
   "No generic words, no duplicates, no sentences. Only pure keywords.";
-  
-export function isSupportedImage(mimeType?: string | null, fileName?: string): boolean {
-  if (mimeType) return SUPPORTED_IMAGE_PREFIXES.some((p) => mimeType.startsWith(p));
+
+export function isSupportedImage(
+  mimeType?: string | null,
+  fileName?: string
+): boolean {
+  if (mimeType)
+    return SUPPORTED_IMAGE_PREFIXES.some((p) => mimeType.startsWith(p));
   if (fileName) {
     const ext = fileName.split(".").pop()?.toLowerCase() ?? "";
     return ["jpg", "jpeg", "png", "webp", "gif"].includes(ext);
@@ -45,7 +59,8 @@ export function extractImageDesc(result: unknown): string {
   if (typeof result === "string") return result;
   if (result && typeof result === "object" && !Array.isArray(result)) {
     const record = result as Record<string, unknown>;
-    const text = record.response ?? record.description ?? record.text ?? record.result;
+    const text =
+      record.response ?? record.description ?? record.text ?? record.result;
     if (typeof text === "string") return text;
   }
   return "";
@@ -56,24 +71,25 @@ export function normalizeDesc(desc: string): string {
     .toLowerCase()
     .replace(/[^a-z0-9\u4e00-\u9fa5,\s-]/g, "") // 仅保留字母数字、中文、逗号、空格、连字符
     .split(",")
-    .map(tag => tag.trim().slice(0, 24))       // 限制单个 tag 长度，防止长句污染
-    .filter(Boolean);                          // 过滤空值
+    .map((tag) => tag.trim().slice(0, 24)) // 限制单个 tag 长度，防止长句污染
+    .filter(Boolean); // 过滤空值
 
   // 使用 Set 去重，再重新拼接并限制总长度
-  return Array.from(new Set(parsedTags))
-    .join(", ")
-    .slice(0, MAX_DESC_LENGTH);
+  return Array.from(new Set(parsedTags)).join(", ").slice(0, MAX_DESC_LENGTH);
 }
 
 /**
  * 核心优化：利用 CF 边缘节点拉取并实时压缩图片，返回轻量级 ArrayBuffer
  */
-export async function fetchResizedImageBuffer(botToken: string, fileId: string): Promise<ArrayBuffer | null> {
+export async function fetchResizedImageBuffer(
+  botToken: string,
+  fileId: string
+): Promise<ArrayBuffer | null> {
   const filePath = await getTgFilePath(fileId, botToken);
   if (!filePath) return null;
 
   const url = buildTgFileUrl(botToken, filePath);
-  
+
   // 利用 Cloudflare Image Resizing，将压缩计算卸载到边缘节点
   const res = await fetch(url, {
     cf: {
@@ -101,12 +117,19 @@ async function resolveAnalysisBuffer(
   const targetId = source.previewFileId || source.tgFileId;
 
   // 1. 优先走 Cloudflare Resizing 链路 (无论原图多大，出来的都是小图)
-  if (env.TG_BOT_TOKEN && targetId) {
+  // 多 Bot 池：file_id 与 bot 绑定，用上传时记录的槽位取 token；缺省探测主 bot
+  if (targetId) {
     try {
-      const buffer = await fetchResizedImageBuffer(env.TG_BOT_TOKEN, targetId);
-      if (buffer) return buffer;
+      const botToken = getTgSlot(env, source.tgSlot)?.token;
+      if (botToken) {
+        const buffer = await fetchResizedImageBuffer(botToken, targetId);
+        if (buffer) return buffer;
+      }
     } catch (err) {
-      console.warn("[AI] CF Resize fetch failed, falling back to memory file:", err);
+      console.warn(
+        "[AI] CF Resize fetch failed, falling back to memory file:",
+        err
+      );
     }
   }
 
@@ -123,19 +146,21 @@ export async function analyzeImageAndEnrich(
   kv: KVWithMetadata,
   key: string,
   file: File | Blob,
-  source: AIImageSource = {},
+  source: AIImageSource = {}
 ): Promise<void> {
   if (!env.AI) return;
 
   try {
     const buffer = await resolveAnalysisBuffer(env, file, source);
     if (!buffer) {
-      console.warn(`[AI] Skip enrich: No suitable image buffer resolved for key: ${key}`);
+      console.warn(
+        `[AI] Skip enrich: No suitable image buffer resolved for key: ${key}`
+      );
       return;
     }
 
     const result = await env.AI.run(AI_MODEL, {
-      image: Array.from(new Uint8Array(buffer)), 
+      image: Array.from(new Uint8Array(buffer)),
       prompt: AI_OUTPUT_PROMPT,
       max_tokens: AI_MAX_TOKENS,
     });

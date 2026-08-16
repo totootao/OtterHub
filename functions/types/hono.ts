@@ -32,6 +32,13 @@ export type Env = {
   TG_BOT_TOKEN?: string;
   TG_WEBHOOK_SECRET?: string;
 
+  /**
+   * 多 Bot/多频道池（可选，防 Telegram 流控）：
+   * JSON 数组 [{"token":"...","chatId":"..."}, ...] 或简化串 "token|chatId,token|chatId"。
+   * 未配置时回退单槽位（TG_BOT_TOKEN + TG_CHAT_ID），行为与旧版一致。
+   */
+  TG_BOT_POOLS?: string;
+
   /** 自托管远程 KV（可选）：配置后元数据存储整体切换到自建服务，绕过 Cloudflare KV 写配额限制 */
   KV_ENDPOINT?: string;
   KV_AUTH_TOKEN?: string;

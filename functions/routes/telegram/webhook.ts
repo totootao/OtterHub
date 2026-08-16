@@ -1,9 +1,10 @@
-import { Hono } from "hono";
+import { Hono, Context } from "hono";
 import { FileMetadata, MAX_CHUNK_SIZE } from "@shared/types";
 import type { Env } from "../../types/hono";
 import { authMiddleware } from "../../middleware/auth";
 import { buildKeyId } from "@utils/file";
 import { fail, ok } from "@utils/response";
+import { getTgPool, getTgSlot } from "@utils/tg-pool";
 import {
   buildTgApiUrl,
   buildTelegramDirectLink,
@@ -15,6 +16,8 @@ export const telegramWebhookRoutes = new Hono<{ Bindings: Env }>();
 
 telegramWebhookRoutes.use("/webhook/setup", authMiddleware);
 telegramWebhookRoutes.use("/webhook/info", authMiddleware);
+telegramWebhookRoutes.use("/webhook/:slot/setup", authMiddleware);
+telegramWebhookRoutes.use("/webhook/:slot/info", authMiddleware);
 
 /**
  * Telegram webhook 健康检查入口。
@@ -23,16 +26,32 @@ telegramWebhookRoutes.get("/webhook", async (c) => {
   return ok(c, {
     ready: true,
     endpoint: new URL(c.req.url).pathname,
+    poolSize: getTgPool(c.env).length,
   });
 });
 
 /**
  * 接收 Telegram message/channel_post 并将媒体 file_id 注册到 OtterHub KV。
+ *
+ * 多 Bot 池说明：file_id 与 bot 绑定。每个池内 bot 的 webhook 指向
+ * /telegram/webhook/<slot>（槽位号），据此把 tgSlot 写入文件元数据，
+ * 下载时用对应 bot 的 token。旧地址 /telegram/webhook 视为槽位 0。
  */
-telegramWebhookRoutes.post("/webhook", async (c) => {
-  if (!c.env.TG_BOT_TOKEN) {
-    return fail(c, "TG_BOT_TOKEN is not configured", 500);
+const handleWebhookUpdate = async (
+  c: Context<{ Bindings: Env }>,
+  rawSlot?: string
+) => {
+  const pool = getTgPool(c.env);
+  if (!pool.length) {
+    return fail(c, "TG bot pool not configured", 500);
   }
+
+  const parsedSlot = Number(rawSlot);
+  const slot =
+    Number.isInteger(parsedSlot) && parsedSlot >= 0 && parsedSlot < pool.length
+      ? parsedSlot
+      : 0;
+  const slotInfo = getTgSlot(c.env, slot)!;
 
   const expectedSecret = c.env.TG_WEBHOOK_SECRET;
   if (expectedSecret) {
@@ -76,7 +95,7 @@ telegramWebhookRoutes.post("/webhook", async (c) => {
   const existing = await c.env.oh_file_url.getWithMetadata<FileMetadata>(key);
   if (existing.metadata) {
     if (shouldNotify) {
-      const noticeResult = await sendTelegramUploadNotice(c.env.TG_BOT_TOKEN, {
+      const noticeResult = await sendTelegramUploadNotice(slotInfo.token, {
         chatId,
         replyToMessageId: message.message_id,
         directLink,
@@ -112,12 +131,13 @@ telegramWebhookRoutes.post("/webhook", async (c) => {
     thumbUrl: media.previewFileId
       ? `/file/${media.previewFileId}/thumb`
       : undefined,
+    tgSlot: slot, // file_id 属于该槽位的 bot，下载须用其 token
   };
 
   await c.env.oh_file_url.put(key, "", { metadata });
 
   if (shouldNotify) {
-    const noticeResult = await sendTelegramUploadNotice(c.env.TG_BOT_TOKEN, {
+    const noticeResult = await sendTelegramUploadNotice(slotInfo.token, {
       chatId,
       replyToMessageId: message.message_id,
       directLink,
@@ -139,20 +159,39 @@ telegramWebhookRoutes.post("/webhook", async (c) => {
     key,
     url: directLink,
   });
-});
+};
+
+/** 旧地址（兼容已设置的 webhook）：槽位 0 */
+telegramWebhookRoutes.post("/webhook", (c) => handleWebhookUpdate(c));
+
+/** 多 Bot 池地址：/telegram/webhook/<slot> */
+telegramWebhookRoutes.post("/webhook/:slot{\\d+}", (c) =>
+  handleWebhookUpdate(c, c.req.param("slot"))
+);
 
 /**
- * 查询当前 Telegram webhook 绑定状态。
+ * 查询指定槽位的 Telegram webhook 绑定状态（?slot=N，默认 0）。
  */
-telegramWebhookRoutes.get("/webhook/info", async (c) => {
-  if (!c.env.TG_BOT_TOKEN) {
+const handleWebhookInfo = async (
+  c: Context<{ Bindings: Env }>,
+  rawSlot?: string
+) => {
+  const pool = getTgPool(c.env);
+  if (!pool.length) {
     return ok(c, {
       configured: false,
       reason: "missing-token",
     });
   }
 
-  const result = await callTelegramApi(c.env.TG_BOT_TOKEN, "getWebhookInfo");
+  const parsedSlot = Number(rawSlot);
+  const slot =
+    Number.isInteger(parsedSlot) && parsedSlot >= 0 && parsedSlot < pool.length
+      ? parsedSlot
+      : 0;
+  const slotInfo = getTgSlot(c.env, slot)!;
+
+  const result = await callTelegramApi(slotInfo.token, "getWebhookInfo");
   if (!result.ok) {
     return fail(
       c,
@@ -162,26 +201,45 @@ telegramWebhookRoutes.get("/webhook/info", async (c) => {
   }
 
   return ok(c, {
+    slot,
+    poolSize: pool.length,
     configured: Boolean(result.result?.url),
     url: result.result?.url || "",
     pendingUpdateCount: result.result?.pending_update_count ?? 0,
     lastErrorMessage: result.result?.last_error_message,
   });
-});
+};
+
+telegramWebhookRoutes.get("/webhook/info", (c) => handleWebhookInfo(c));
+telegramWebhookRoutes.get("/webhook/:slot/info", (c) =>
+  handleWebhookInfo(c, c.req.param("slot"))
+);
 
 /**
- * 使用后端环境变量配置 Telegram webhook。
+ * 使用后端环境变量配置指定槽位的 Telegram webhook（?slot=N，默认 0）。
+ * 多 Bot 池：每个 bot 各自调用一次（slot=0,1,2...），webhook 地址带槽位号。
  */
-telegramWebhookRoutes.post("/webhook/setup", async (c) => {
-  if (!c.env.TG_BOT_TOKEN) {
-    return fail(c, "TG_BOT_TOKEN is not configured", 500);
+const handleWebhookSetup = async (
+  c: Context<{ Bindings: Env }>,
+  rawSlot?: string
+) => {
+  const pool = getTgPool(c.env);
+  if (!pool.length) {
+    return fail(c, "TG bot pool not configured", 500);
   }
   if (!c.env.TG_WEBHOOK_SECRET) {
     return fail(c, "TG_WEBHOOK_SECRET is not configured", 400);
   }
 
-  const webhookUrl = buildTelegramWebhookUrl(new URL(c.req.url).origin);
-  const result = await callTelegramApi(c.env.TG_BOT_TOKEN, "setWebhook", {
+  const parsedSlot = Number(rawSlot);
+  const slot =
+    Number.isInteger(parsedSlot) && parsedSlot >= 0 && parsedSlot < pool.length
+      ? parsedSlot
+      : 0;
+  const slotInfo = getTgSlot(c.env, slot)!;
+
+  const webhookUrl = buildTelegramWebhookUrl(new URL(c.req.url).origin, slot);
+  const result = await callTelegramApi(slotInfo.token, "setWebhook", {
     url: webhookUrl,
     secret_token: c.env.TG_WEBHOOK_SECRET,
     allowed_updates: ["message", "channel_post"],
@@ -192,10 +250,17 @@ telegramWebhookRoutes.post("/webhook/setup", async (c) => {
   }
 
   return ok(c, {
+    slot,
+    poolSize: pool.length,
     webhookUrl,
     telegramResult: result,
   });
-});
+};
+
+telegramWebhookRoutes.post("/webhook/setup", (c) => handleWebhookSetup(c));
+telegramWebhookRoutes.post("/webhook/:slot/setup", (c) =>
+  handleWebhookSetup(c, c.req.param("slot"))
+);
 
 /**
  * 调用 Telegram Bot API 并返回解析后的 JSON。
@@ -218,9 +283,11 @@ async function callTelegramApi(
 }
 
 /**
- * 生成当前部署可访问的 Telegram webhook URL。
+ * 生成当前部署可访问的 Telegram webhook URL（槽位 0 用旧地址，保持兼容）。
  */
-function buildTelegramWebhookUrl(origin: string): string {
+function buildTelegramWebhookUrl(origin: string, slot: number): string {
   const base = origin.replace(/\/+$/, "");
-  return `${base}/telegram/webhook`;
+  return slot === 0
+    ? `${base}/telegram/webhook`
+    : `${base}/telegram/webhook/${slot}`;
 }

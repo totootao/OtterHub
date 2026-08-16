@@ -1,5 +1,4 @@
 import { BaseAdapter } from "./base-adapter";
-import { getTextFromCache, putTextToCache } from "@utils/cache";
 import { failResponse } from "@utils/response";
 import { encodeContentDisposition } from "../common";
 import {
@@ -8,6 +7,14 @@ import {
   getContentTypeByExt,
   getFileTypeByMimeOrExt,
 } from "../file";
+import {
+  getTgPool,
+  getTgSlot,
+  pickTgSlotIndex,
+  pickChunkSlotIndex,
+  resolveTgFilePath,
+  sleep,
+} from "../tg-pool";
 
 import {
   FileMetadata,
@@ -29,7 +36,6 @@ import {
   resolveFileDescriptor,
   buildTgApiUrl,
   buildTgFileUrl,
-  getTgFilePath,
   processGifFile,
 } from "./tg-tools";
 
@@ -46,35 +52,14 @@ export class TGAdapter extends BaseAdapter {
 
   private async getCachedTgFilePath(
     fileId: string,
-    forceRefresh: boolean = false
+    forceRefresh: boolean = false,
+    preferSlot?: number
   ): Promise<string | null> {
-    if (!forceRefresh) {
-      try {
-        const cachedPath = await getTextFromCache("tgpath", fileId);
-        if (cachedPath) {
-          return cachedPath;
-        }
-      } catch (error) {
-        console.warn(
-          `[TGAdapter] Cache read failed for fileId: ${fileId}`,
-          error
-        );
-      }
-    }
-
-    const filePath = await getTgFilePath(fileId, this.env.TG_BOT_TOKEN);
-    if (!filePath) return null;
-
-    try {
-      await putTextToCache("tgpath", fileId, filePath, 3300);
-    } catch (error) {
-      console.warn(
-        `[TGAdapter] Cache write failed for fileId: ${fileId}`,
-        error
-      );
-    }
-
-    return filePath;
+    const resolved = await resolveTgFilePath(this.env, fileId, {
+      preferSlot,
+      forceRefresh,
+    });
+    return resolved?.filePath ?? null;
   }
 
   async uploadFile(
@@ -100,9 +85,13 @@ export class TGAdapter extends BaseAdapter {
         type: mime,
       });
       const formData = new FormData();
-      formData.append("chat_id", this.env.TG_CHAT_ID);
       formData.append("document", placeholder);
-      const result = await this.sendToTelegram(formData, "sendDocument");
+      const result = await this.sendToTelegram(
+        formData,
+        "sendDocument",
+        3,
+        pickTgSlotIndex(getTgPool(this.env).length)
+      );
       if (!result.success) {
         throw new Error(result.message);
       }
@@ -113,6 +102,7 @@ export class TGAdapter extends BaseAdapter {
       const key = buildKeyId(fileType, tgFileId, ext);
       metadata.emptyFile = true;
       metadata.fileSize = 0; // 逻辑大小保持 0（TG 返回的实际 1 字节不覆盖）
+      metadata.tgSlot = result.slotIndex; // file_id 与 bot 绑定，记录槽位供下载使用
       const kv = this.env[this.kvName];
       if (kv) {
         await kv.put(key, "", { metadata });
@@ -141,10 +131,15 @@ export class TGAdapter extends BaseAdapter {
     );
 
     const formData = new FormData();
-    formData.append("chat_id", this.env.TG_CHAT_ID);
     formData.append(field, processedFile);
 
-    const result = await this.sendToTelegram(formData, apiEndpoint);
+    // 多 Bot 池：秒级时间片轮询选槽，429 时由 sendToTelegram 自动换槽重试
+    const result = await this.sendToTelegram(
+      formData,
+      apiEndpoint,
+      3,
+      pickTgSlotIndex(getTgPool(this.env).length)
+    );
     if (!result.success) {
       throw new Error(result.message);
     }
@@ -177,6 +172,7 @@ export class TGAdapter extends BaseAdapter {
     }
 
     const key = buildKeyId(fileType, tgFileId, ext);
+    metadata.tgSlot = result.slotIndex; // file_id 与 bot 绑定，记录槽位供下载使用
 
     const kv = this.env[this.kvName];
     if (kv) {
@@ -215,6 +211,7 @@ export class TGAdapter extends BaseAdapter {
           {
             previewFileId: imageVariantIds.previewFileId,
             tgFileId: tgFileId,
+            tgSlot: result.slotIndex,
           }
         );
         if (waitUntil) {
@@ -247,15 +244,15 @@ export class TGAdapter extends BaseAdapter {
   /**
    * 上传分片到 Telegram 存储
    * 由基类的 consumeChunk 模板方法调用
+   * 多 Bot 池：同一文件内按分片序号轮询槽位（0→bot0, 1→bot1...），最大化分摊流控
    */
   protected async uploadToTarget(
     chunkFile: File | Blob | Uint8Array,
     parentKey: string,
     chunkIndex: number,
     fileName?: string
-  ): Promise<{ chunkId: string; thumbUrl?: string }> {
+  ): Promise<{ chunkId: string; thumbUrl?: string; slot: number }> {
     const formData = new FormData();
-    formData.append("chat_id", this.env.TG_CHAT_ID);
 
     // 确保是 File 实例以便带有文件名
     let fileToUpload: File;
@@ -278,49 +275,30 @@ export class TGAdapter extends BaseAdapter {
 
     formData.append("document", fileToUpload);
 
-    const apiUrl = buildTgApiUrl(this.env.TG_BOT_TOKEN, "sendDocument");
-
-    // 添加超时控制
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 60000); // 60秒超时
-
-    try {
-      const response = await fetch(apiUrl, {
-        method: "POST",
-        body: formData,
-        signal: controller.signal,
-      });
-      clearTimeout(timeoutId);
-
-      const result = await response.json();
-
-      if (!result.ok) {
-        throw new Error(
-          `Chunk ${chunkIndex} upload failed: ${
-            result.description || "Unknown error"
-          }`
-        );
-      }
-
-      const chunkId = result.result.document.file_id;
-      let thumbUrl: string | undefined;
-
-      // 尝试获取缩略图
-      if (chunkIndex === 0) {
-        const thumbFileId = getVideoThumbId(result);
-        if (thumbFileId) {
-          thumbUrl = `/file/${thumbFileId}/thumb`;
-        }
-      }
-
-      return { chunkId, thumbUrl };
-    } catch (error: any) {
-      clearTimeout(timeoutId);
-      if (error.name === "AbortError") {
-        throw new Error(`Chunk ${chunkIndex} upload timeout after 60s`);
-      }
-      throw error;
+    const result = await this.sendToTelegram(
+      formData,
+      "sendDocument",
+      3,
+      pickChunkSlotIndex(getTgPool(this.env).length, chunkIndex)
+    );
+    if (!result.success) {
+      throw new Error(
+        `Chunk ${chunkIndex} upload failed: ${result.message || "Unknown error"}`
+      );
     }
+
+    const chunkId = result.data.result.document.file_id;
+    let thumbUrl: string | undefined;
+
+    // 尝试获取缩略图
+    if (chunkIndex === 0) {
+      const thumbFileId = getVideoThumbId(result.data);
+      if (thumbFileId) {
+        thumbUrl = `/file/${thumbFileId}/thumb`;
+      }
+    }
+
+    return { chunkId, thumbUrl, slot: result.slotIndex };
   }
 
   async get(key: string, req?: Request): Promise<Response> {
@@ -373,8 +351,15 @@ export class TGAdapter extends BaseAdapter {
       const ext = key.substring(key.lastIndexOf(".") + 1);
       const contentType = getContentTypeByExt(ext);
 
-      let filePath = await this.getCachedTgFilePath(fileId);
-      if (!filePath) {
+      // 按上传时记录的槽位解析（旧数据无 tgSlot → 探测主 bot 及其余槽位）
+      let resolved = await resolveTgFilePath(this.env, fileId, {
+        preferSlot: metadata.tgSlot,
+      });
+      if (!resolved) {
+        return failResponse(`File not found for key: ${key}`, 404);
+      }
+      const slot = getTgSlot(this.env, resolved.slot);
+      if (!slot) {
         return failResponse(`File not found for key: ${key}`, 404);
       }
 
@@ -390,27 +375,41 @@ export class TGAdapter extends BaseAdapter {
       const range = req?.headers.get("Range") || null;
 
       const fetchFromTg = async (currentFilePath: string) => {
-        const tgUrl = buildTgFileUrl(this.env.TG_BOT_TOKEN, currentFilePath);
+        const tgUrl = buildTgFileUrl(slot!.token, currentFilePath);
         return range
           ? fetch(tgUrl, { headers: { Range: range } })
           : fetch(tgUrl);
       };
 
-      let tgResp = await fetchFromTg(filePath);
+      let tgResp = await fetchFromTg(resolved.filePath);
 
       // Telegram 链接有效期 1 小时，如遇 401/404 错误则强制刷新缓存并重试一次
       if (tgResp.status === 401 || tgResp.status === 404) {
         console.log(
           `[TGAdapter] TG URL expired or invalid (Status: ${tgResp.status}). Retrying for key: ${key}`
         );
-        filePath = await this.getCachedTgFilePath(fileId, true);
-        if (!filePath) {
+        const refreshed = await resolveTgFilePath(this.env, fileId, {
+          preferSlot: metadata.tgSlot,
+          forceRefresh: true,
+        });
+        if (!refreshed) {
           return failResponse(
             `File not found for key: ${key} after retry`,
             404
           );
         }
-        tgResp = await fetchFromTg(filePath);
+        resolved = refreshed;
+        const refreshedSlot = getTgSlot(this.env, resolved.slot);
+        if (!refreshedSlot) {
+          return failResponse(`File not found for key: ${key}`, 404);
+        }
+        const refreshedUrl = buildTgFileUrl(
+          refreshedSlot.token,
+          resolved.filePath
+        );
+        tgResp = await (range
+          ? fetch(refreshedUrl, { headers: { Range: range } })
+          : fetch(refreshedUrl));
       }
 
       if (range) {
@@ -482,10 +481,14 @@ export class TGAdapter extends BaseAdapter {
     const start = rangeResult ? rangeResult.start : 0;
     const end = rangeResult ? rangeResult.end : totalSize - 1;
 
-    // 准备上下文
-    const botToken = this.env.TG_BOT_TOKEN;
-    const getFilePath = (fileId: string, forceRefresh = false) =>
-      this.getCachedTgFilePath(fileId, forceRefresh);
+    // 准备上下文（多 Bot 池：每个分片按各自上传槽位解析路径与 token）
+    const getChunkToken = (slotIndex?: number) =>
+      getTgSlot(this.env, slotIndex)?.token ?? "";
+    const getFilePath = (
+      fileId: string,
+      forceRefresh = false,
+      preferSlot?: number
+    ) => this.getCachedTgFilePath(fileId, forceRefresh, preferSlot);
 
     // 创建连续流
     const stream = new ReadableStream({
@@ -536,9 +539,13 @@ export class TGAdapter extends BaseAdapter {
               cEnd: number,
               forceRefresh = false
             ) => {
-              const filePath = await getFilePath(c.file_id, forceRefresh);
+              const filePath = await getFilePath(
+                c.file_id,
+                forceRefresh,
+                c.slot
+              );
               if (!filePath) throw new Error(`Missing chunk ${c.idx}`);
-              const url = buildTgFileUrl(botToken, filePath);
+              const url = buildTgFileUrl(getChunkToken(c.slot), filePath);
 
               // 计算该分片内的请求范围，并转换为相对于该分片的 Range
               const reqStart = Math.max(cStart, start);
@@ -635,21 +642,58 @@ export class TGAdapter extends BaseAdapter {
   }
 
   // https://core.telegram.org/bots/api#sending-files
+  /**
+   * 统一 Telegram 上传通道（多 Bot 池感知）
+   *
+   * - 每次尝试都会把 formData 的 chat_id 绑定为当前槽位的 chatId
+   * - 429 流控：优先切换到未尝试过的槽位立即重试（不消耗重试次数）；
+   *   所有槽位都限流后再退避重试（尊重 retry_after）
+   * - 其他失败：指数退避 + 轮转到下一槽位重试
+   * - sendPhoto 失败降级为 sendDocument 的逻辑保持不变
+   * - 单次请求 60s 超时
+   *
+   * @returns 成功时携带实际使用的 slotIndex（写入 metadata.tgSlot / chunk.slot）
+   */
   private async sendToTelegram(
     formData: FormData,
     apiEndpoint: string,
-    retryCount = 3
-  ): Promise<ApiResponse<any>> {
-    const apiUrl = buildTgApiUrl(this.env.TG_BOT_TOKEN, apiEndpoint);
+    retryCount = 3,
+    slotIndex = 0,
+    visitedSlots: number[] = []
+  ): Promise<ApiResponse<any> & { slotIndex: number }> {
+    const pool = getTgPool(this.env);
+    if (!pool.length) {
+      return {
+        success: false,
+        slotIndex: 0,
+        message: "TG bot pool not configured (TG_BOT_POOLS / TG_BOT_TOKEN)",
+      };
+    }
+    const idx = ((slotIndex % pool.length) + pool.length) % pool.length;
+    const slot = pool[idx];
+    const apiUrl = buildTgApiUrl(slot.token, apiEndpoint);
+
+    // chat_id 必须与 bot 槽位匹配（每个 bot 只能向自己所在的 chat 发送）
+    formData.set("chat_id", slot.chatId);
+
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 60000);
 
     try {
-      const response = await fetch(apiUrl, { method: "POST", body: formData });
+      const response = await fetch(apiUrl, {
+        method: "POST",
+        body: formData,
+        signal: controller.signal,
+      });
+      clearTimeout(timeoutId);
       const responseData = await response.json();
 
       if (response.ok) {
-        return { success: true, data: responseData };
+        return { success: true, data: responseData, slotIndex: idx };
       }
 
+      const isRateLimit =
+        response.status === 429 || responseData?.error_code === 429;
       const attempt = 3 - retryCount;
       const backoffMs = Math.min(30000, Math.pow(2, attempt) * 1000);
       const retryAfterSec =
@@ -661,42 +705,77 @@ export class TGAdapter extends BaseAdapter {
           ? Math.max(backoffMs, retryAfterSec * 1000)
           : backoffMs;
 
-      // 所有类型的文件上传失败都重试
-      if (retryCount > 0) {
-        // 图片类型特殊处理：转为文档方式重试
-        if (apiEndpoint === "sendPhoto") {
-          const newFormData = new FormData();
-          newFormData.append("chat_id", formData.get("chat_id") as string);
-          newFormData.append("document", formData.get("photo") as File);
-          await new Promise((resolve) => setTimeout(resolve, waitMs));
-          return await this.sendToTelegram(
-            newFormData,
-            "sendDocument",
-            retryCount - 1
+      // 流控且池中还有未尝试的槽位：换槽重试，不消耗重试次数
+      if (isRateLimit) {
+        const nextVisited = [...visitedSlots, idx];
+        const unvisited = pool
+          .map((_, i) => i)
+          .filter((i) => !nextVisited.includes(i));
+        if (unvisited.length > 0) {
+          console.warn(
+            `[TGAdapter] Rate limited on slot ${idx}, switching to slot ${unvisited[0]}`
+          );
+          await sleep(Math.min(waitMs, 1500));
+          return this.sendToTelegram(
+            formData,
+            apiEndpoint,
+            retryCount,
+            unvisited[0],
+            nextVisited
           );
         }
-        // 其他类型直接重试
-        await new Promise((resolve) => setTimeout(resolve, waitMs));
-        return await this.sendToTelegram(formData, apiEndpoint, retryCount - 1);
+      }
+
+      // 图片类型特殊处理：转为文档方式重试
+      if (retryCount > 0) {
+        if (apiEndpoint === "sendPhoto") {
+          const newFormData = new FormData();
+          newFormData.append("document", formData.get("photo") as File);
+          await sleep(waitMs);
+          return this.sendToTelegram(
+            newFormData,
+            "sendDocument",
+            retryCount - 1,
+            idx
+          );
+        }
+        // 其他类型：退避后轮转到下一槽位重试
+        await sleep(waitMs);
+        return this.sendToTelegram(
+          formData,
+          apiEndpoint,
+          retryCount - 1,
+          idx + 1
+        );
       }
 
       return {
         success: false,
+        slotIndex: idx,
         message: `Upload to Telegram failed: ${
           responseData.description || "Unknown error"
         }`,
       };
     } catch (error: any) {
+      clearTimeout(timeoutId);
       if (retryCount > 0) {
-        const attempt = 3 - retryCount;
-        const backoffMs = Math.min(30000, Math.pow(2, attempt) * 1000);
-        await new Promise((resolve) => setTimeout(resolve, backoffMs));
-        return await this.sendToTelegram(formData, apiEndpoint, retryCount - 1);
+        const isAbort = error?.name === "AbortError";
+        const backoffMs = isAbort
+          ? 2000
+          : Math.min(30000, Math.pow(2, 3 - retryCount) * 1000);
+        await sleep(backoffMs);
+        return this.sendToTelegram(
+          formData,
+          apiEndpoint,
+          retryCount - 1,
+          idx + 1
+        );
       }
       return {
         success: false,
+        slotIndex: idx,
         message: `Network error occurred: ${
-          error.message || "Unknown network error"
+          error?.message || "Unknown network error"
         }`,
       };
     }

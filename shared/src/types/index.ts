@@ -50,6 +50,7 @@ export type FileMetadata = {
   desc?: string; // 图片简短描述（上传后 AI 自动分析填充）
   isDir?: boolean; // WebDAV 目录标记（MKCOL 创建的虚拟目录，fileName 存相对路径）
   emptyFile?: boolean; // 空文件标记（TG 不接受 0 字节，物理存储为 1 字节占位，读取时返回空内容）
+  tgSlot?: number; // TG 多 Bot 池槽位（file_id 与 bot 绑定，下载须用对应 bot；缺省为主 bot）
 };
 
 export enum FileTag {
@@ -90,6 +91,7 @@ export type Chunk = {
   idx: number;
   file_id: string; // Telegram: file_id / R2: chunk key
   size: number; // 分片大小
+  slot?: number; // TG 多 Bot 池槽位（file_id 与 bot 绑定；缺省为主 bot）
 };
 
 // Cloudflare KV list参数
