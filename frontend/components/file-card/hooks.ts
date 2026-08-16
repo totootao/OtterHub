@@ -8,7 +8,7 @@ import {
   getFileTypeFromKey,
   downloadFile,
   getMissingChunkIndices,
-  processBatch,
+  uploadChunksWithRetry,
 } from "@/lib/utils";
 import {
   getFileDownloadUrl,
@@ -220,7 +220,8 @@ export function useFileCardActions(file: FileItem) {
         chunkInfo.uploadedIndices
       );
 
-      await processBatch(
+      // 失败分片多轮自动重试，单片失败不再中断整个续传
+      const stillFailed = await uploadChunksWithRetry(
         chunkIndicesToUpload,
         async (chunkIndex) => {
           const start = chunkIndex * MAX_CHUNK_SIZE;
@@ -229,9 +230,18 @@ export function useFileCardActions(file: FileItem) {
 
           await uploadChunk(file.name, chunkIndex, chunkFile);
         },
-        undefined,
-        MAX_CONCURRENTS
+        {
+          concurrency: MAX_CONCURRENTS,
+          maxRounds: 3,
+          onRoundRetry: (round, count) => {
+            toast.warning(`${count} 片失败，开始第 ${round} 轮重试`);
+          },
+        }
       );
+
+      if (stillFailed.length > 0) {
+        throw new Error(`${stillFailed.length} 片仍未成功，可稍后再次续传`);
+      }
 
       await new Promise((resolve) => setTimeout(resolve, 500));
       window.location.reload();
