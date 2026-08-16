@@ -12,6 +12,7 @@ import {
   getTgSlot,
   pickTgSlotIndex,
   pickChunkSlotIndex,
+  recordTgError,
   resolveTgFilePath,
   sleep,
 } from "../tg-pool";
@@ -704,6 +705,15 @@ export class TGAdapter extends BaseAdapter {
         retryAfterSec !== undefined
           ? Math.max(backoffMs, retryAfterSec * 1000)
           : backoffMs;
+
+      // 诊断：TG API 非 200 全量记录到 KV 环形日志（GET /telegram/pool/errors 查看）
+      void recordTgError(this.env, {
+        op: apiEndpoint,
+        slot: idx,
+        code: responseData?.error_code ?? response.status,
+        desc: String(responseData?.description || "").slice(0, 120),
+        ra: retryAfterSec,
+      });
 
       // 流控且池中还有未尝试的槽位：换槽重试，不消耗重试次数
       if (isRateLimit) {

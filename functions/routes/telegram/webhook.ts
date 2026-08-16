@@ -4,7 +4,12 @@ import type { Env } from "../../types/hono";
 import { authMiddleware } from "../../middleware/auth";
 import { buildKeyId } from "@utils/file";
 import { fail, ok } from "@utils/response";
-import { getTgPool, getTgSlot } from "@utils/tg-pool";
+import {
+  getTgPool,
+  getTgSlot,
+  getTgErrorLog,
+  clearTgErrorLog,
+} from "@utils/tg-pool";
 import {
   buildTgApiUrl,
   buildTelegramDirectLink,
@@ -18,6 +23,22 @@ telegramWebhookRoutes.use("/webhook/setup", authMiddleware);
 telegramWebhookRoutes.use("/webhook/info", authMiddleware);
 telegramWebhookRoutes.use("/webhook/:slot/setup", authMiddleware);
 telegramWebhookRoutes.use("/webhook/:slot/info", authMiddleware);
+telegramWebhookRoutes.use("/pool/errors", authMiddleware);
+telegramWebhookRoutes.use("/pool/errors/clear", authMiddleware);
+
+/**
+ * TG API 错误环形日志（诊断流控）：
+ * sendToTelegram / getFile 的非 200 响应全量记录，保留最近 40 条。
+ */
+telegramWebhookRoutes.get("/pool/errors", async (c) => {
+  const log = await getTgErrorLog(c.env);
+  return ok(c, { count: log.length, log });
+});
+
+telegramWebhookRoutes.post("/pool/errors/clear", async (c) => {
+  await clearTgErrorLog(c.env);
+  return ok(c, true);
+});
 
 /**
  * Telegram webhook 健康检查入口。

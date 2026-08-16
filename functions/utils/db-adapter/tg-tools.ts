@@ -27,15 +27,36 @@ export function buildTgFileUrl(botToken: string, filePath: string): string {
  */
 export async function getTgFilePath(
   fileId: string,
-  botToken: string
+  botToken: string,
+  onError?: (info: { status: number; code: number; desc: string }) => void
 ): Promise<string | null> {
   const url = buildTgApiUrl(botToken, "getFile");
   const res = await fetch(`${url}?file_id=${fileId}`);
 
-  if (!res.ok) return null;
+  if (!res.ok) {
+    let code = res.status;
+    let desc = `HTTP ${res.status}`;
+    try {
+      const d = await res.json();
+      code = d?.error_code ?? res.status;
+      desc = d?.description || desc;
+    } catch {
+      // 非 JSON 响应（网关错误等），保留 HTTP 状态
+    }
+    onError?.({ status: res.status, code, desc });
+    return null;
+  }
 
   const data = await res.json();
-  return data?.ok ? data.result.file_path : null;
+  if (!data?.ok) {
+    onError?.({
+      status: res.status,
+      code: data?.error_code ?? 0,
+      desc: data?.description || "unknown",
+    });
+    return null;
+  }
+  return data.result.file_path;
 }
 
 /**
@@ -224,8 +245,7 @@ export function getTgImageVariantIds(response: any): TgImageVariantIds {
 
   // 对于大于 5MB 的通过 sendDocument 上传的图片，似乎没有 thumb 返回
   const documentResult = response.result.document as
-    | TgDocumentResult
-    | undefined;
+    TgDocumentResult | undefined;
   if (!documentResult?.file_id) {
     return { fileId: null, previewFileId: null };
   }

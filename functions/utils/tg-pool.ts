@@ -84,25 +84,43 @@ function normalizeIndex(index: number | undefined, size: number): number {
 }
 
 /**
+ * 跨 isolate 槽位分散策略：
+ * - isolatePhase：每个 isolate 启动时随机相位，避免不同 isolate 的
+ *   计数器从 0 开始同步增长（实测纯计数器在多 isolate 下仍会集体撞同一槽位）
+ * - rrCounter：isolate 内自增，保证同一实例内同秒并发请求互不碰撞
+ * 时钟分量让不同时间到达的请求天然轮转；残余的跨 isolate 偶发碰撞
+ * 由 sendToTelegram 的 429 自动换槽兜底
+ */
+const isolatePhase = Math.floor(Math.random() * 1_000_000);
+let rrCounter = 0;
+function nextRR(): number {
+  return isolatePhase + rrCounter++;
+}
+
+/**
  * 上传槽位选择（单文件/小文件路径）：
- * 秒级时间片轮询。Worker 无实例状态，这是零 KV 写入的均匀分摊方式，
- * 相邻秒的请求必然落到不同槽位。
+ * 秒级时间片 + 随机相位 + isolate 内计数。
+ * 纯秒级取模在并发上传时会全部命中同一槽位（实测 3 并发上传即触发
+ * Telegram 单聊天 1 msg/s 流控），混合后同 isolate 并发互不碰撞、
+ * 跨 isolate 也随机错开。
  */
 export function pickTgSlotIndex(poolSize: number): number {
   if (poolSize <= 1) return 0;
-  return Math.floor(Date.now() / 1000) % poolSize;
+  return (Math.floor(Date.now() / 1000) + nextRR()) % poolSize;
 }
 
 /**
  * 分片上传槽位选择：
- * 同一文件内按分片序号轮询（0→bot0, 1→bot1, ...），分摊效果最均匀。
+ * 分片序号 + 随机相位 + isolate 内计数。
+ * 纯序号取模时，多个文件并行上传各自的 chunk0 会全部命中槽位 0，
+ * 混合后不同文件的相同序号分片也互不碰撞。
  */
 export function pickChunkSlotIndex(
   poolSize: number,
   chunkIndex: number
 ): number {
   if (poolSize <= 1) return 0;
-  return chunkIndex % poolSize;
+  return (chunkIndex + nextRR()) % poolSize;
 }
 
 /**
@@ -143,7 +161,20 @@ export async function resolveTgFilePath(
     ...pool.map((_, i) => i).filter((i) => i !== preferSlot),
   ];
   for (const slotIndex of order) {
-    const filePath = await getTgFilePath(fileId, pool[slotIndex].token);
+    const filePath = await getTgFilePath(
+      fileId,
+      pool[slotIndex].token,
+      (info) => {
+        // 诊断：getFile 失败全量记录（429 流控 / wrong file_id / 网络错误均可区分）
+        void recordTgError(env, {
+          op: "getFile",
+          slot: slotIndex,
+          code: info.code,
+          desc: info.desc.slice(0, 120),
+          fid: fileId.slice(0, 20),
+        });
+      }
+    );
     if (filePath) {
       try {
         await putTextToCache(
@@ -181,4 +212,46 @@ function parsePathCache(
 
 export function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// ==========================================
+// TG API 错误环形日志（诊断流控用）
+// 写入 KV（自建 RemoteKV 无配额压力），保留最近 40 条，
+// 通过 GET /telegram/pool/errors 读取，POST /telegram/pool/errors/clear 清空。
+// 注：并发写入存在读改写竞态，极端时丢个别条目，诊断场景可接受。
+// ==========================================
+const ERRLOG_KEY = "tgpool:errlog";
+const ERRLOG_MAX = 40;
+
+export async function recordTgError(
+  env: any,
+  entry: Record<string, any>
+): Promise<void> {
+  try {
+    const kv = env?.oh_file_url;
+    if (!kv) return;
+    const cur = await kv.get(ERRLOG_KEY);
+    const arr: any[] = cur ? JSON.parse(cur) : [];
+    arr.unshift({ t: Date.now(), ...entry });
+    await kv.put(ERRLOG_KEY, JSON.stringify(arr.slice(0, ERRLOG_MAX)));
+  } catch {
+    // 诊断日志失败不影响主流程
+  }
+}
+
+export async function getTgErrorLog(env: any): Promise<any[]> {
+  try {
+    const cur = await env?.oh_file_url?.get(ERRLOG_KEY);
+    return cur ? JSON.parse(cur) : [];
+  } catch {
+    return [];
+  }
+}
+
+export async function clearTgErrorLog(env: any): Promise<void> {
+  try {
+    await env?.oh_file_url?.delete(ERRLOG_KEY);
+  } catch {
+    // ignore
+  }
 }
